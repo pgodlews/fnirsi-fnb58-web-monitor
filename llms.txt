@@ -1,0 +1,48 @@
+# FNB58 BLE Monitor
+
+> Browser-based Bluetooth Low Energy monitor for FNIRSI FNB58, FNB48 and FNB38 USB power meters.
+
+## What it does
+
+A single-page web application that connects to FNIRSI FNB-series USB power meters over Bluetooth Low Energy (BLE) and displays real-time electrical measurements in the browser. No installation, no account, no server — all data stays in the browser.
+
+## Measurements displayed
+
+- Voltage (V) and current (A)
+- Power (W, calculated)
+- Accumulated capacity: Ah and Wh
+- D+ / D- data line voltages
+- Temperature (the meter's own internal sensor)
+- Fast-charge protocol detection (PD, QC 2.0/3.0, FCP, SCP, VOOC, PPS, DCP)
+
+## Features
+
+- Live dual-axis chart with a selectable time window (60 s to 24 h, or auto)
+- Four chart tabs: V/A, accumulated Capacity (Ah/Wh), D+/D-, and Temperature
+- Session recording with 10-second aggregation buckets stored in IndexedDB
+- CSV export of any recorded session, with local-timezone timestamps
+- PNG screenshot of any chart tab, stamped with the start and end time
+- Demo mode: synthetic data trace runs automatically so the UI is explorable without a device
+- Disconnect freeze: chart holds the last frame when the device disconnects
+
+## Compatible devices
+
+- FNIRSI FNB58
+- FNIRSI FNB48
+- FNIRSI FNB38
+
+All three use the RFstar transparent UART BLE profile (service UUID ffe0/ffe5, CRC16-XMODEM framing).
+
+## Technical details
+
+- Pure client-side HTML/CSS/JavaScript, no build step
+- Web Bluetooth API (Chrome or Edge required)
+- BLE protocol: RFstar UART, service ffe0 (notify) + ffe5 (write)
+- Local storage: IndexedDB (no data leaves the browser)
+- Chart rendered on an HTML5 Canvas element
+
+## Source & licence
+
+Source code: https://github.com/pgodlews/fnirsi-fnb58-web-monitor
+Protocol reference: https://github.com/yeckel/OpenFNB58
+Licence: GPL-3.0

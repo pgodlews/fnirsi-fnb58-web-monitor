@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://fnb58.ai-sommelier.co.uk/sitemap.xml

@@ -1,0 +1,11 @@
+# Claude Code workspace state
+.claude/
+
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+*~
+.vscode/
+.idea/
