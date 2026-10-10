@@ -99,11 +99,13 @@ The voltage trace dips or wanders instead of holding its PD level.
 A cable that sags badly also slows charging and generates heat.
 
 ### 3.6 Wrong / downgraded protocol (D+/D- tab)
-Healthy fast-charge negotiation shows **stable, flat** D+/D- lines and a named
-protocol (QC, PD, PPS, etc.). Watch for:
+The protocol label is a **D+/D- estimate** for some legacy charging schemes.
+USB-C PD and PPS negotiate on CC, so their negotiation cannot be identified
+from this tab. Idle data lines show unknown (`—`) and do not imply a charger
+or cable fault. For legacy charging schemes, watch for:
 - D+/D- **jumping around** → repeated renegotiation, usually a marginal cable.
-- Protocol stuck at **DCP** (both lines near 0 V) when fast charge is expected
-  → cable lacks the right wiring, or charger/device mismatch.
+- An unexpected estimate → compare with known-good gear and the meter's own
+  protocol display before drawing conclusions about a mismatch.
 
 ### 3.7 The Temp tab — meter temperature, read with caution
 The Temp tab shows the **FNB58's own internal temperature**, not the battery's.
@@ -160,7 +162,7 @@ The meter's reading is only useful here as ambient context.
 |-----|--------------|-----------------|
 | **V / A** | CC plateau width, taper shape, voltage knee | Voltage sag, current stability |
 | **Capacity** | Total Ah/Wh delivered to full — capacity-fade trend | Total Ah/Wh extracted before cutoff |
-| **D+ / D−** | Protocol negotiated and whether it stays stable | (usually flat — less relevant) |
+| **D+ / D−** | Legacy protocol estimate and data-line stability; cannot identify PD/PPS | (usually flat — less relevant) |
 | **Temp** | Meter temperature only — use to confirm similar ambient between tests | Same — ambient context, not pack heat |
 
 Use the **PNG export** to snapshot each tab — the screenshot now stamps the
@@ -195,7 +197,7 @@ start→end time, so dated images can be filed against a device.
 | Full-charge capacity vs baseline | >90 % | 80–90 % | <80 % |
 | Voltage sag under rated load | <3 % | 3–5 % | >5 % |
 | Charge duration vs baseline | ≈baseline | +10–25 % | >+25 % |
-| Protocol (D+/D-) | stable, expected | occasional renegotiation | stuck on DCP / constant jumping |
+| D+/D- (legacy charging only) | stable, expected | occasional changes | repeated changes with known-good gear; confirm on meter |
 
 The Temp tab is deliberately absent from this table — it reports the meter's
 own temperature and is not a battery-health threshold. Use it only to confirm

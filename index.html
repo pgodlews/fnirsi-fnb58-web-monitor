@@ -843,7 +843,7 @@
     <div class="val"><span id="mDn">—</span><span class="u">V</span></div>
   </div>
   <div class="strip-cell">
-    <div class="lbl">Protocol</div>
+    <div class="lbl" title="D+/D− estimate only; USB PD/PPS cannot be identified from these signals">Protocol estimate</div>
     <div class="val"><span class="protocol-tag none" id="mProto">—</span></div>
   </div>
   <div class="strip-cell">
@@ -1036,7 +1036,7 @@ function parsePackets(buffer) {
     const expected = PKT_LENS[type];
     if (!expected) { i++; continue; }
     if (len !== expected) { i++; continue; }
-    if (i + 3 + len > buffer.length) break;
+    if (i + 4 + len > buffer.length) break;
     const data = buffer.slice(i + 3, i + 3 + len);
     const chk = buffer[i + 3 + len];
     const inner = buffer.slice(i, i + 3 + len);
@@ -1049,14 +1049,13 @@ function parsePackets(buffer) {
 }
 
 function inferProtocol(dp, dn) {
+  // Legacy D+/D− heuristics only. PD/PPS negotiate over CC and cannot be
+  // identified here; idle data lines do not establish a DCP connection either.
   if (dp > 0.55 && dp < 0.75 && dn > 0.55 && dn < 0.75) return "QC 2.0";
   if (dp > 1.8 && dp < 2.8 && dn > 1.8 && dn < 2.8) return "QC 3.0";
   if (dp > 2.6 && dp < 3.0 && dn < 0.7) return "FCP";
   if (dp > 1.1 && dp < 1.3 && dn < 0.7) return "SCP";
   if (dp > 2.6 && dp < 3.0 && dn > 2.6 && dn < 3.0) return "VOOC";
-  if (dp > 0.45 && dp < 0.65 && dn > 1.8 && dn < 2.8) return "PD";
-  if (dp > 2.0 && dp < 3.0 && dn > 0.45 && dn < 0.65) return "PPS";
-  if (dp < 0.2 && dn < 0.2) return "DCP";
   return "—";
 }
 
@@ -1169,8 +1168,8 @@ class Logger {
 }
 
 function avg(a) { return a.reduce((s, x) => s + x, 0) / a.length; }
-function min(a) { return a.length ? Math.min(...a) : 0; }
-function max(a) { return a.length ? Math.max(...a) : 0; }
+function min(a) { return a.length ? a.reduce((lo, x) => Math.min(lo, x), Infinity) : 0; }
+function max(a) { return a.length ? a.reduce((hi, x) => Math.max(hi, x), -Infinity) : 0; }
 
 /* ================================================================
    Chart — redesigned: dual-axis, soft fills, grid, time labels
@@ -1189,12 +1188,15 @@ class Chart {
     new ResizeObserver(() => this.resize()).observe(canvas.parentElement);
   }
   get winSec() {
-    if (this.mode === 'auto') {
-      if (!this.data.length) return 60;
-      const span = (performance.now() / 1000) - this.data[0].t;
-      return Math.max(60, span);
-    }
-    return this.fixedWinSec;
+    return this.getTimeRange().win;
+  }
+  getTimeRange() {
+    const end = this.frozen ? this.frozenAt : performance.now() / 1000;
+    const endWall = this.frozen ? this.frozenWallAt : Date.now();
+    const win = this.mode === 'auto'
+      ? Math.max(60, this.data.length ? end - this.data[0].t : 60)
+      : this.fixedWinSec;
+    return { end, start: end - win, win, endWall, startWall: endWall - win * 1000 };
   }
   resize() {
     const rect = this.c.getBoundingClientRect();
@@ -1215,8 +1217,11 @@ class Chart {
     this.mode = mode;
     if (fixedWinSec !== undefined) this.fixedWinSec = fixedWinSec;
   }
-  freeze() { this.frozen = true; this.frozenAt = performance.now() / 1000; }
-  unfreeze() { this.frozen = false; this.frozenAt = null; }
+  freeze() {
+    if (this.frozen) return;
+    this.frozen = true; this.frozenAt = performance.now() / 1000; this.frozenWallAt = Date.now();
+  }
+  unfreeze() { this.frozen = false; this.frozenAt = null; this.frozenWallAt = null; }
 
   fmtTime(sec) {
     if (sec <= 0) return 'now';
@@ -1230,10 +1235,10 @@ class Chart {
   draw() {
     const ctx = this.ctx, w = this.w, h = this.h;
     ctx.clearRect(0, 0, w, h);
-    const now = this.frozen ? (this.frozenAt || performance.now() / 1000) : performance.now() / 1000;
-    const win = this.frozen ? Math.max(60, this.frozenAt - (this.data.length ? this.data[0].t : 0)) : this.winSec;
-    const t0 = now - win;
-    const slice = this.data.filter(d => d.t >= t0);
+    const range = this.getTimeRange();
+    this.drawnRange = range;
+    const { start: t0, end, win } = range;
+    const slice = this.data.filter(d => d.t >= t0 && d.t <= end);
     const L = this.padL, R = w - this.padR, T = this.padT, B = h - this.padB;
     const plotW = R - L, plotH = B - T;
     this._drawSharedFrame(ctx, L, R, T, B, plotW, plotH, win, w, h);
@@ -1292,7 +1297,7 @@ class Chart {
 
   _drawVA(ctx, slice, L, R, T, B, plotW, plotH, t0, win) {
     let vmax, amax;
-    if (slice.length > 1) { vmax = Math.max(1, ...slice.map(d => d.v)) * 1.12; amax = Math.max(0.5, ...slice.map(d => d.a)) * 1.25; }
+    if (slice.length > 1) { vmax = Math.max(1, max(slice.map(d => d.v))) * 1.12; amax = Math.max(0.5, max(slice.map(d => d.a))) * 1.25; }
     else { vmax = 6; amax = 1; }
     vmax = niceCeil(vmax); amax = niceCeil(amax, 0.5);
     ctx.font = '500 10px "JetBrains Mono", monospace';
@@ -1313,7 +1318,7 @@ class Chart {
   _drawCapacity(ctx, slice, L, R, T, B, plotW, plotH, t0, win, w, h) {
     const pts = slice.filter(d => Number.isFinite(d.wh) && Number.isFinite(d.ah));
     let ahmax, whmax;
-    if (pts.length > 1) { ahmax = niceCeil(Math.max(0.01, ...pts.map(d => d.ah)) * 1.2, 0.01); whmax = niceCeil(Math.max(0.05, ...pts.map(d => d.wh)) * 1.2, 0.05); }
+    if (pts.length > 1) { ahmax = niceCeil(Math.max(0.01, max(pts.map(d => d.ah))) * 1.2, 0.01); whmax = niceCeil(Math.max(0.05, max(pts.map(d => d.wh))) * 1.2, 0.05); }
     else { ahmax = 1; whmax = 5; }
     ctx.font = '500 10px "JetBrains Mono", monospace';
     this._yAxisLabels(ctx, L, R, T, B, plotH,
@@ -1334,7 +1339,7 @@ class Chart {
   _drawDpDn(ctx, slice, L, R, T, B, plotW, plotH, t0, win, w, h) {
     const pts = slice.filter(d => Number.isFinite(d.dp) && Number.isFinite(d.dn));
     let vmax;
-    if (pts.length > 1) { vmax = niceCeil(Math.max(0.6, ...pts.map(d => Math.max(d.dp, d.dn))) * 1.15); }
+    if (pts.length > 1) { vmax = niceCeil(Math.max(0.6, max(pts.map(d => Math.max(d.dp, d.dn)))) * 1.15); }
     else { vmax = 3.5; }
     ctx.font = '500 10px "JetBrains Mono", monospace';
     this._yAxisLabels(ctx, L, R, T, B, plotH, vmax, 'V', 2, null, null, null,
@@ -1354,7 +1359,7 @@ class Chart {
   _drawTemp(ctx, slice, L, R, T, B, plotW, plotH, t0, win, w, h) {
     const pts = slice.filter(d => Number.isFinite(d.temp));
     let cmax;
-    if (pts.length > 1) { cmax = niceCeil(Math.max(40, ...pts.map(d => d.temp)) * 1.15); }
+    if (pts.length > 1) { cmax = niceCeil(Math.max(40, max(pts.map(d => d.temp))) * 1.15); }
     else { cmax = 60; }
     ctx.font = '500 10px "JetBrains Mono", monospace';
     this._yAxisLabels(ctx, L, R, T, B, plotH, cmax, '°C', 0, null, null, null,
@@ -1396,6 +1401,8 @@ class BleClient {
     this.onMeasurement = null; this.onStatus = null; this.onGroupData = null;
     this._rxBuf = new Uint8Array(0);
     this.streaming = false;
+    this._handleNotification = e => this._onData(e.target.value);
+    this._handleDisconnect = () => this._onDisconnect();
   }
   async scanConnect() {
     if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported. Use Chrome/Edge.');
@@ -1403,20 +1410,22 @@ class BleClient {
       filters: [{ namePrefix: 'FNB' }],
       optionalServices: [SVC_NOTIFY, SVC_WRITE]
     });
+    this.device.addEventListener('gattserverdisconnected', this._handleDisconnect);
     this.server = await this.device.gatt.connect();
     const svcN = await this.server.getPrimaryService(SVC_NOTIFY);
     const svcW = await this.server.getPrimaryService(SVC_WRITE);
     this.charNotify = await svcN.getCharacteristic(CHAR_NOTIFY);
     this.charWrite  = await svcW.getCharacteristic(CHAR_WRITE);
-    this.charNotify.addEventListener('characteristicvaluechanged', e => this._onData(e.target.value));
-    this.device.addEventListener('gattserverdisconnected', () => this._onDisconnect());
+    this.charNotify.addEventListener('characteristicvaluechanged', this._handleNotification);
   }
   async startStream() {
-    if (!this.charNotify) return;
+    if (!this.charNotify) throw new Error('Device is not connected.');
+    const notify = this.charNotify;
     this._rxBuf = new Uint8Array(0);
     await this.charNotify.startNotifications();
     await this.write(makeCmd(0x81));
     await new Promise(r => setTimeout(r, 2000));
+    if (this.charNotify !== notify) throw new Error('Device disconnected while starting stream.');
     await this.write(makeCmd(0x82));
     this.streaming = true;
   }
@@ -1426,14 +1435,26 @@ class BleClient {
     try { await this.charNotify.stopNotifications(); } catch(e) {}
     this._rxBuf = new Uint8Array(0);
   }
-  async write(data) { if (this.charWrite) await this.charWrite.writeValueWithoutResponse(data); }
-  async disconnect() {
-    this.streaming = false;
-    if (this.device && this.device.gatt.connected) await this.device.gatt.disconnect();
+  async write(data) {
+    if (!this.charWrite) throw new Error('Device is not connected.');
+    await this.charWrite.writeValueWithoutResponse(data);
   }
-  _onDisconnect() { this.streaming = false; if (this.onStatus) this.onStatus('disconnected'); }
+  _resetConnection() {
+    if (this.charNotify) this.charNotify.removeEventListener('characteristicvaluechanged', this._handleNotification);
+    if (this.device) this.device.removeEventListener('gattserverdisconnected', this._handleDisconnect);
+    this.streaming = false;
+    this.device = null; this.server = null; this.charNotify = null; this.charWrite = null;
+    this._rxBuf = new Uint8Array(0);
+  }
+  async disconnect() {
+    const device = this.device;
+    this._resetConnection();
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    if (device && this.onStatus) this.onStatus('disconnected');
+  }
+  _onDisconnect() { this._resetConnection(); if (this.onStatus) this.onStatus('disconnected'); }
   _onData(value) {
-    const chunk = new Uint8Array(value.buffer);
+    const chunk = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     const buf = new Uint8Array(this._rxBuf.length + chunk.length);
     buf.set(this._rxBuf); buf.set(chunk, this._rxBuf.length);
     const { packets, consumed } = parsePackets(buf);
@@ -1479,7 +1500,7 @@ class BleClient {
 const $ = id => document.getElementById(id);
 
 const state = {
-  connected: false, streaming: false, recording: false,
+  connected: false, connecting: false, streaming: false, recording: false,
   client: new BleClient(), logger: new Logger(), chart: null,
   last: { vbus: 0, ibus: 0, power: 0, temp: NaN, dp: NaN, dn: NaN, protocol: '—', wh: 0, ah: 0 },
   stats: { iMin: Infinity, iMax: -Infinity, pSum: 0, pN: 0, pMax: 0 },
@@ -1508,6 +1529,15 @@ function setConnState(s, label) {
   else { live.classList.remove('active'); live.querySelector('span:last-child').textContent = 'standby'; }
 }
 
+function accumulateStats(v, a) {
+  if (!Number.isFinite(v) || !Number.isFinite(a)) return;
+  const power = v * a;
+  state.stats.iMin = Math.min(state.stats.iMin, a);
+  state.stats.iMax = Math.max(state.stats.iMax, a);
+  state.stats.pSum += power; state.stats.pN++;
+  state.stats.pMax = Math.max(state.stats.pMax, power);
+}
+
 function updateMetrics() {
   const m = state.last;
   bigNumber($('mVbus'), m.vbus, 2);
@@ -1517,13 +1547,6 @@ function updateMetrics() {
   $('mDpInline').textContent = Number.isNaN(m.dp) ? '—' : fmt(m.dp, 2) + 'V';
   $('mDnInline').textContent = Number.isNaN(m.dn) ? '—' : fmt(m.dn, 2) + 'V';
 
-  // Stats
-  if (m.ibus > 0) {
-    state.stats.iMin = Math.min(state.stats.iMin, m.ibus);
-    state.stats.iMax = Math.max(state.stats.iMax, m.ibus);
-    state.stats.pSum += m.power; state.stats.pN++;
-    state.stats.pMax = Math.max(state.stats.pMax, m.power);
-  }
   $('mIbusMin').textContent = state.stats.iMin === Infinity ? '—' : fmt(state.stats.iMin, 3) + 'A';
   $('mIbusMax').textContent = state.stats.iMax === -Infinity ? '—' : fmt(state.stats.iMax, 3) + 'A';
   $('mPowerAvg').textContent = state.stats.pN ? fmt(state.stats.pSum / state.stats.pN, 2) + 'W' : '—';
@@ -1556,6 +1579,7 @@ function updateMetrics() {
 function onMeasurement(m) {
   Object.assign(state.last, m);
   if (m.vbus !== undefined && m.ibus !== undefined) {
+    accumulateStats(m.vbus, m.ibus);
     state.chart.push(m.vbus, m.ibus, state.last.dp, state.last.dn, state.last.wh, state.last.ah, state.last.temp);
     if (state.recording) state.logger.ingest({ t: performance.now() / 1000, wall: Date.now(), v: m.vbus, a: m.ibus, wh: state.last.wh, ah: state.last.ah, temp: state.last.temp });
   }
@@ -1572,7 +1596,7 @@ function onStatus(type, info) {
     }
     setConnState('idle', 'Disconnected');
     state.connected = false; state.streaming = false;
-    $('btnConnect').disabled = false;
+    $('btnConnect').disabled = state.connecting;
     $('btnStream').disabled = true;
     $('btnDisconnect').disabled = true;
     $('btnRecord').disabled = true;
@@ -1647,13 +1671,16 @@ function sanitizeFilename(name) {
 
 /* Buttons */
 $('btnConnect').addEventListener('click', async () => {
+  if (state.connecting || state.connected) return;
+  state.connecting = true;
+  $('btnConnect').disabled = true;
   try {
     setConnState('idle', 'Pairing…');
-    await state.client.scanConnect();
-    state.connected = true;
     state.client.onMeasurement = onMeasurement;
     state.client.onStatus = onStatus;
     state.client.onGroupData = onGroupData;
+    await state.client.scanConnect();
+    state.connected = true;
     stopDemo();
 
     // Auto-start streaming
@@ -1671,7 +1698,15 @@ $('btnConnect').addEventListener('click', async () => {
     $('graphEmpty').classList.add('hidden');
     state.chart.unfreeze();
     $('dcBanner').classList.remove('visible');
-  } catch (e) { setConnState('error', e.message); console.error(e); }
+  } catch (e) {
+    await state.client.disconnect();
+    state.connected = false; state.streaming = false;
+    if (state.demo) { state.chart.unfreeze(); $('dcBanner').classList.remove('visible'); }
+    setConnState('error', e.message); console.error(e);
+  } finally {
+    state.connecting = false;
+    $('btnConnect').disabled = state.connected;
+  }
 });
 
 $('btnStream').addEventListener('click', async () => {
@@ -1745,6 +1780,7 @@ function localStamp(ms) {
 }
 
 async function exportSessionCsv(s) {
+  if (s.id === state.logger.sessionId) await state.logger._flush();
   const samples = await state.logger.getSamples(s.id);
   if (!samples.length) return alert(`Session "${s.name}" has no recorded samples.`);
   const dur = s.endedAt ? Math.round((s.endedAt - s.startedAt) / 1000) : Math.round((Date.now() - s.startedAt) / 1000);
@@ -1802,16 +1838,17 @@ $('chartTabs').addEventListener('click', e => {
 });
 
 $('btnExportPng').addEventListener('click', () => {
+  // Render immediately so the exported tab, range and timestamp agree.
+  state.chart.draw();
+  const range = state.chart.drawnRange;
   const src = state.chart.c;
   const tmp = document.createElement('canvas');
   tmp.width = src.width; tmp.height = src.height;
   const ctx = tmp.getContext('2d');
   ctx.drawImage(src, 0, 0);
   const dpr = state.chart.dpr;
-  const nowMs = Date.now();
-  const startMs = nowMs - state.chart.winSec * 1000;
   const fmtTs = ms => new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-  const label = `${fmtTs(startMs)}  →  ${fmtTs(nowMs)}`;
+  const label = `${fmtTs(range.startWall)}  →  ${fmtTs(range.endWall)}`;
   const pad = 6 * dpr, fh = 11 * dpr, bw = 296 * dpr, bh = 18 * dpr;
   const vpad = (22 + 8) * dpr; // clear the time-axis label row (padB=22)
   ctx.fillStyle = 'rgba(0,0,0,0.50)';
@@ -1842,6 +1879,7 @@ function startDemo() {
     state.last.power = v * a;
     state.last.dp = 0.50; state.last.dn = 0.52; state.last.temp = 25.0;
     state.last.protocol = '—'; state.last.wh = 0.3278; state.last.ah = 0.0640;
+    accumulateStats(v, a);
     state.chart.push(v, a, state.last.dp, state.last.dn, state.last.wh, state.last.ah, state.last.temp);
     updateMetrics();
   }, 100);
