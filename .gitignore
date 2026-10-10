@@ -9,3 +9,6 @@
 *~
 .vscode/
 .idea/
+
+# Development dependencies
+node_modules/

@@ -55,11 +55,29 @@ The entire app is a single `index.html` file. Just save it and open it via `http
 | **Live Stream** | Real-time voltage, current, power, D+/D−, temperature, protocol |
 | **Canvas Graph** | Dual-axis live plot with selectable window (60 s … 24 h or auto), dark theme |
 | **Chart Tabs** | Switch between V/A, accumulated Capacity (Ah/Wh), D+/D−, and Temperature |
-| **Protocol Detection** | PD, QC 2.0/3.0, FCP, SCP, VOOC, PPS, DCP |
+| **Protocol Estimate** | D+/D− heuristics for QC 2.0/3.0, FCP, SCP and VOOC; PD/PPS cannot be identified from these signals |
 | **Session Logging** | 10-second aggregate buckets stored in browser (IndexedDB) |
 | **CSV Export** | Download any session as CSV, with local-timezone timestamps |
 | **PNG Export** | Screenshot any chart tab, stamped with the start→end time |
 | **Group Control** | Switch / clear the device's 10 cumulative Wh/Ah groups |
+
+Protocol names are estimates, not decoded negotiations. USB-C PD and PPS use
+the CC line; idle D+/D− lines therefore show unknown (`—`), not DCP. These
+estimates should not be used to diagnose a failed PD negotiation.
+
+## Development checks
+
+The hosted app still has no runtime dependencies or build step. To run the
+regression checks with Node.js 22 or later:
+
+```bash
+npm ci
+npm test
+```
+
+The checks use simulated BLE notifications, a canvas/DOM stub and IndexedDB
+emulation. Actual meter compatibility still needs a hardware check in Chrome
+or Edge.
 
 ---
 
