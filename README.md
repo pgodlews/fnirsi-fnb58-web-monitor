@@ -79,6 +79,11 @@ The checks use simulated BLE notifications, a canvas/DOM stub and IndexedDB
 emulation. Actual meter compatibility still needs a hardware check in Chrome
 or Edge.
 
+The same checks run in GitHub Actions on every pull request and on every push
+to `main`. Once they pass on `main`, the workflow publishes `index.html`,
+`robots.txt`, `sitemap.xml` and `llms.txt` to GitHub Pages. This needs
+**Settings → Pages → Source** set to **GitHub Actions**.
+
 ---
 
 ## BLE Protocol
