@@ -73,7 +73,7 @@ function fixture({ delay = cb => cb() } = {}) {
   });
   vm.runInContext(script + `\nglobalThis.api = {
     parsePackets, makeCmd, BleClient, Chart, Logger, min, max, inferProtocol,
-    state, onMeasurement, onGroupData, updateMetrics, exportSessionCsv, startDemo
+    state, onMeasurement, onGroupData, onStatus, updateMetrics, exportSessionCsv, startDemo, decimate, firstIndex
   };`, sandbox);
   const api = sandbox.api;
   api.state.chart = new api.Chart(element('chart'));
@@ -311,4 +311,172 @@ test('disconnect during initialization cannot revive a stale stream', async () =
   assert.equal(f.state.streaming, false);
   assert.equal(f.state.client.charWrite, null);
   assert.equal(f.element('btnConnect').disabled, false);
+});
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+
+test('time-axis labels state the exact offset instead of flooring to whole minutes', () => {
+  const f = fixture(); const chart = f.state.chart;
+  const ticks = win => Array.from({ length: 7 }, (_, i) => chart.fmtTime(win - win * i / 6));
+  assert.deepEqual(ticks(60), ['-1m', '-50s', '-40s', '-30s', '-20s', '-10s', 'now']);
+  assert.deepEqual(ticks(300), ['-5m', '-4m10s', '-3m20s', '-2m30s', '-1m40s', '-50s', 'now']);
+  assert.deepEqual(ticks(14400), ['-4h', '-3h20m', '-2h40m', '-2h', '-1h20m', '-40m', 'now']);
+  assert.equal(chart.fmtTime(3599.7), '-1h');
+});
+
+test('long histories are reduced per pixel column without losing extremes', () => {
+  const f = fixture();
+  const data = Array.from({ length: 144000 }, (_, i) => ({ ...point(i / 10), v: 5, a: 1 }));
+  data[70001].v = 20; data[70002].a = 0; data[5].temp = NaN;
+  const out = f.decimate(data, 0, data.length, 0, 14400, 700, ['v', 'a']);
+  assert.ok(out.length <= 700 * 6, `kept ${out.length}`);
+  assert.equal(f.max(out.map(d => d.v)), 20);
+  assert.equal(f.min(out.map(d => d.a)), 0);
+  assert.equal(out[0], data[0]);
+  assert.equal(out.at(-1), data.at(-1));
+  assert.ok(out.every((d, i) => !i || d.t > out[i - 1].t), 'time order preserved');
+  const few = f.decimate(data, 10, 500, 1, 49, 700, ['v', 'a']);
+  assert.equal(few.length, 490, 'short ranges are passed through untouched');
+  assert.equal(f.firstIndex(data, 1, false), 10);
+  assert.equal(f.firstIndex(data, 1, true), 11);
+  assert.equal(f.firstIndex(data, -1, false), 0);
+  assert.equal(f.firstIndex(data, 1e9, true), data.length);
+});
+
+test('a visible range is drawn from only the readings inside it', () => {
+  const f = fixture(); const chart = f.state.chart;
+  chart.data = [point(0), { ...point(100), v: 40 }, point(7190), point(7200)];
+  f.setTime(7200); chart.setMode('fixed', 60); chart.draw();
+  assert.ok(f.labels.includes('10.0V'), 'axis scaled to the in-window 5 V, not the 40 V outside it');
+  assert.ok(!f.labels.includes('50.0V'));
+});
+
+for (const how of ['Disconnect button', 'unexpected link drop']) {
+  test(`${how} while recording closes the session and leaves Record disabled`, async () => {
+    const f = fixture(); const logger = f.state.logger;
+    await logger.init();
+    const { device } = bleDevice(f);
+    await f.click('btnConnect');
+    await f.click('btnRecord');
+    assert.equal(f.state.recording, true);
+    f.onMeasurement({ vbus: 5, ibus: 1, power: 5 });
+    if (how === 'Disconnect button') await f.click('btnDisconnect'); else device.gatt.disconnect();
+    await settle();
+    assert.equal(f.state.recording, false);
+    assert.equal(logger.sessionId, null);
+    assert.equal(f.element('btnRecord').disabled, true, 'nothing to record from once offline');
+    assert.equal(f.element('btnStopRecord').disabled, true);
+    const sessions = await logger.listSessions();
+    assert.equal(sessions.length, 1);
+    assert.equal(typeof sessions[0].endedAt, 'number');
+    assert.equal((await logger.getSamples(sessions[0].id)).length, 1);
+  });
+}
+
+test('stopping a recording while the stream is paused does not offer Record', async () => {
+  const f = fixture(); await f.state.logger.init(); bleDevice(f);
+  await f.click('btnConnect'); await f.click('btnRecord');
+  await f.click('btnStream');
+  assert.equal(f.state.streaming, false);
+  await f.click('btnStopRecord');
+  assert.equal(f.element('btnRecord').disabled, true);
+  await f.click('btnStream');
+  assert.equal(f.element('btnRecord').disabled, false);
+  await f.click('btnDisconnect');
+});
+
+test('a failed stream start is reported and can be retried', async () => {
+  const f = fixture(); bleDevice(f);
+  await f.click('btnConnect'); await f.click('btnStream');
+  assert.equal(f.state.streaming, false);
+  const write = f.state.client.charWrite; const send = write.writeValueWithoutResponse;
+  write.writeValueWithoutResponse = async () => { throw new Error('GATT busy'); };
+  await f.click('btnStream');
+  assert.equal(f.state.streaming, false);
+  assert.equal(f.element('statusText').textContent, 'GATT busy');
+  assert.equal(f.element('btnStream').disabled, false);
+  write.writeValueWithoutResponse = send;
+  await f.click('btnStream');
+  assert.equal(f.state.streaming, true);
+  assert.equal(f.element('statusText').textContent, 'Streaming');
+  await f.click('btnDisconnect');
+});
+
+test('a second click while the stream is starting does not start it twice', async () => {
+  const delays = [];
+  const f = fixture({ delay: cb => delays.push(cb) }); bleDevice(f);
+  const connecting = f.click('btnConnect');
+  await new Promise(setImmediate); delays.shift()(); await connecting;
+  await f.click('btnStream');
+  const first = f.click('btnStream');
+  await new Promise(setImmediate);
+  await f.click('btnStream');
+  assert.equal(delays.length, 1);
+  delays.shift()(); await first;
+  assert.equal(f.state.streaming, true);
+  await f.click('btnDisconnect');
+});
+
+test('a failed group command is reported without dropping the live state', async () => {
+  const f = fixture(); bleDevice(f);
+  await f.click('btnConnect');
+  f.state.client.charWrite.writeValueWithoutResponse = async () => { throw new Error('GATT busy'); };
+  await f.click('btnClearGroup');
+  assert.equal(f.element('statusText').textContent, 'Clear group 6 failed: GATT busy');
+  assert.equal(f.element('connPill').dataset.state, 'streaming');
+  await f.click('btnDisconnect');
+});
+
+test('stopping twice, or starting a new session mid-stop, leaves sessions intact', async () => {
+  const f = fixture(); const logger = f.state.logger;
+  await logger.init();
+  const first = await logger.startSession('First', 6);
+  logger.ingest({ t: 0, wall: 0, v: 5, a: 1 });
+  const stopping = Promise.all([logger.stopSession(), logger.stopSession()]);
+  const second = await logger.startSession('Second', 6);
+  await stopping;
+  assert.equal(logger.sessionId, second, 'the finished stop must not detach the new session');
+  logger.ingest({ t: 1, wall: 1000, v: 5, a: 2 });
+  await logger.stopSession();
+  assert.equal((await logger.getSamples(first)).length, 1);
+  assert.equal((await logger.getSamples(second)).length, 1);
+  assert.ok((await logger.listSessions()).every(s => typeof s.endedAt === 'number'));
+});
+
+test('sessions left open by a closed tab are ended at their last sample', async () => {
+  const f = fixture(); const logger = f.state.logger;
+  await logger.init();
+  const withData = await logger.startSession('Interrupted', 6);
+  const started = Date.UTC(2026, 9, 10, 10);
+  logger.ingest({ t: 0, wall: started + 5000, v: 5, a: 1 }); logger.ingest({ t: 1, wall: started + 9000, v: 5, a: 1 });
+  await logger._flush();
+  logger.sessionId = null; // the tab went away without stopSession()
+  const empty = await logger.startSession('Never sampled', 6);
+  logger.sessionId = null;
+  const live = await logger.startSession('Recording now', 6);
+  await logger.closeOrphanedSessions();
+  const byId = new Map((await logger.listSessions()).map(s => [s.id, s]));
+  assert.equal(byId.get(withData).endedAt, started + 9000);
+  assert.equal(byId.get(empty).endedAt, byId.get(empty).startedAt);
+  assert.equal(byId.get(live).endedAt, null);
+});
+
+test('device info and legend show real zeros and trailing digits', () => {
+  const f = fixture();
+  f.onStatus('info', { model: 58, fw: 1.1, sn: 54181, groupMax: 10, groupCur: 2 });
+  assert.equal(f.element('diFw').textContent, '1.10');
+  f.state.streaming = true;
+  f.onMeasurement({ vbus: 5, ibus: 0, power: 0 });
+  assert.equal(f.element('legendA').textContent, '0.000A');
+  f.state.streaming = false;
+  f.state.last.ibus = 0; f.state.last.vbus = 0; f.updateMetrics();
+  assert.equal(f.element('legendA').textContent, '—');
+});
+
+test('PNG export paints a backdrop before the transparent chart', async () => {
+  const f = fixture(); const calls = [];
+  const ctx = { fillRect: () => calls.push('fill'), drawImage: () => calls.push('image'), fillText() {} };
+  f.sandbox.document.createElement = tag => tag === 'canvas' ? { getContext: () => ctx, toDataURL: () => '' } : f.element(tag);
+  await f.click('btnExportPng');
+  assert.deepEqual(calls.slice(0, 2), ['fill', 'image']);
 });

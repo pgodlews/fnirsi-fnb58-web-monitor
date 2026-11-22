@@ -1100,19 +1100,33 @@ class Logger {
     });
   }
   async stopSession() {
-    if (!this.sessionId) return;
-    await this._flush();
+    const id = this.sessionId;
+    if (!id) return;
+    // Drain the buffer and detach synchronously: a second stop, or a session
+    // started while these writes are in flight, must not touch this one.
+    const flushed = this._flush();
+    this.sessionId = null;
+    try { await flushed; } finally { await this._endSession(id, Date.now()); }
+  }
+  _endSession(id, endedAt) {
     return new Promise((res, rej) => {
       const tx = this.db.transaction('sessions', 'readwrite');
       const store = tx.objectStore('sessions');
-      const req = store.get(this.sessionId);
-      req.onsuccess = () => {
-        const s = req.result;
-        if (s) { s.endedAt = Date.now(); store.put(s); }
-        this.sessionId = null; res();
-      };
-      req.onerror = () => rej(req.error);
+      const req = store.get(id);
+      req.onsuccess = () => { const s = req.result; if (s) { s.endedAt = endedAt; store.put(s); } };
+      tx.oncomplete = () => res();
+      tx.onerror = tx.onabort = () => rej(tx.error);
     });
+  }
+  async closeOrphanedSessions() {
+    // A tab closed mid-recording never wrote endedAt, so the session would read
+    // "in progress" forever and its exported duration would keep growing.
+    for (const s of await this.listSessions()) {
+      if (s.endedAt != null || s.id === this.sessionId) continue;
+      const samples = await this.getSamples(s.id);
+      const last = samples[samples.length - 1];
+      await this._endSession(s.id, Math.max(s.startedAt, last?.wallT1 ?? 0));
+    }
   }
   ingest(m) {
     if (!this.sessionId) return;
@@ -1224,12 +1238,15 @@ class Chart {
   unfreeze() { this.frozen = false; this.frozenAt = null; this.frozenWallAt = null; }
 
   fmtTime(sec) {
+    sec = Math.round(sec);
     if (sec <= 0) return 'now';
-    const m = Math.floor(sec / 60);
-    const h = Math.floor(sec / 3600);
-    if (h > 0) return `-${h}h ${m % 60}m`;
-    if (m > 0) return `-${m}m`;
-    return `-${Math.round(sec)}s`;
+    if (sec >= 3600) {
+      const mins = Math.round(sec / 60), h = Math.floor(mins / 60), m = mins % 60;
+      return m ? `-${h}h${m}m` : `-${h}h`;
+    }
+    const m = Math.floor(sec / 60), s = sec % 60;
+    if (m > 0) return s ? `-${m}m${s}s` : `-${m}m`;
+    return `-${s}s`;
   }
 
   draw() {
@@ -1238,9 +1255,10 @@ class Chart {
     const range = this.getTimeRange();
     this.drawnRange = range;
     const { start: t0, end, win } = range;
-    const slice = this.data.filter(d => d.t >= t0 && d.t <= end);
     const L = this.padL, R = w - this.padR, T = this.padT, B = h - this.padB;
     const plotW = R - L, plotH = B - T;
+    const slice = decimate(this.data, firstIndex(this.data, t0, false), firstIndex(this.data, end, true),
+      t0, win, Math.ceil(plotW * this.dpr), TAB_FIELDS[this.tab] || TAB_FIELDS.va);
     this._drawSharedFrame(ctx, L, R, T, B, plotW, plotH, win, w, h);
     if (this.tab === 'capacity') { this._drawCapacity(ctx, slice, L, R, T, B, plotW, plotH, t0, win, w, h); return; }
     if (this.tab === 'dpdn')    { this._drawDpDn(ctx, slice, L, R, T, B, plotW, plotH, t0, win, w, h); return; }
@@ -1278,12 +1296,12 @@ class Chart {
     }
   }
 
-  _drawLine(ctx, pts, tx, yFn, color, fillColor) {
+  _drawLine(ctx, pts, tx, yFn, color, fillColor, B) {
     if (fillColor) {
       ctx.fillStyle = fillColor; ctx.beginPath();
-      ctx.moveTo(tx(pts[0].t), pts[0]._B);
+      ctx.moveTo(tx(pts[0].t), B);
       pts.forEach(d => ctx.lineTo(tx(d.t), yFn(d)));
-      ctx.lineTo(tx(pts[pts.length-1].t), pts[0]._B);
+      ctx.lineTo(tx(pts[pts.length-1].t), B);
       ctx.closePath(); ctx.fill();
     }
     ctx.strokeStyle = color; ctx.lineWidth = 1.75; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
@@ -1307,9 +1325,8 @@ class Chart {
     const tx = t => L + (t - t0) / win * plotW;
     const vy = d => B - (d.v / vmax) * plotH;
     const ay = d => B - (d.a / amax) * plotH;
-    const tagged = slice.map(d => ({ ...d, _B: B }));
-    this._drawLine(ctx, tagged, tx, vy, 'oklch(0.78 0.13 225)', 'oklch(0.78 0.13 225 / 0.10)');
-    this._drawLine(ctx, tagged, tx, ay, 'oklch(0.79 0.16 150)', 'oklch(0.79 0.16 150 / 0.10)');
+    this._drawLine(ctx, slice, tx, vy, 'oklch(0.78 0.13 225)', 'oklch(0.78 0.13 225 / 0.10)', B);
+    this._drawLine(ctx, slice, tx, ay, 'oklch(0.79 0.16 150)', 'oklch(0.79 0.16 150 / 0.10)', B);
     const last = slice[slice.length - 1], xL = tx(last.t);
     this._dot(ctx, xL, vy(last), 'oklch(0.78 0.13 225)');
     this._dot(ctx, xL, ay(last), 'oklch(0.79 0.16 150)');
@@ -1328,9 +1345,8 @@ class Chart {
     const tx = t => L + (t - t0) / win * plotW;
     const ahy = d => B - (d.ah / ahmax) * plotH;
     const why = d => B - (d.wh / whmax) * plotH;
-    const tagged = pts.map(d => ({ ...d, _B: B }));
-    this._drawLine(ctx, tagged, tx, ahy, 'oklch(0.79 0.16 150)', 'oklch(0.79 0.16 150 / 0.10)');
-    this._drawLine(ctx, tagged, tx, why, 'oklch(0.80 0.14 75)', 'oklch(0.80 0.14 75 / 0.10)');
+    this._drawLine(ctx, pts, tx, ahy, 'oklch(0.79 0.16 150)', 'oklch(0.79 0.16 150 / 0.10)', B);
+    this._drawLine(ctx, pts, tx, why, 'oklch(0.80 0.14 75)', 'oklch(0.80 0.14 75 / 0.10)', B);
     const last = pts[pts.length - 1], xL = tx(last.t);
     this._dot(ctx, xL, ahy(last), 'oklch(0.79 0.16 150)');
     this._dot(ctx, xL, why(last), 'oklch(0.80 0.14 75)');
@@ -1348,9 +1364,8 @@ class Chart {
     const tx = t => L + (t - t0) / win * plotW;
     const dpy = d => B - (d.dp / vmax) * plotH;
     const dny = d => B - (d.dn / vmax) * plotH;
-    const tagged = pts.map(d => ({ ...d, _B: B }));
-    this._drawLine(ctx, tagged, tx, dpy, 'oklch(0.78 0.13 225)', 'oklch(0.78 0.13 225 / 0.10)');
-    this._drawLine(ctx, tagged, tx, dny, 'oklch(0.80 0.14 75)', 'oklch(0.80 0.14 75 / 0.10)');
+    this._drawLine(ctx, pts, tx, dpy, 'oklch(0.78 0.13 225)', 'oklch(0.78 0.13 225 / 0.10)', B);
+    this._drawLine(ctx, pts, tx, dny, 'oklch(0.80 0.14 75)', 'oklch(0.80 0.14 75 / 0.10)', B);
     const last = pts[pts.length - 1], xL = tx(last.t);
     this._dot(ctx, xL, dpy(last), 'oklch(0.78 0.13 225)');
     this._dot(ctx, xL, dny(last), 'oklch(0.80 0.14 75)');
@@ -1367,11 +1382,51 @@ class Chart {
     if (pts.length < 2) { this._drawEmpty(ctx, w, h, 'No temperature data yet'); return; }
     const tx = t => L + (t - t0) / win * plotW;
     const cy = d => B - (d.temp / cmax) * plotH;
-    const tagged = pts.map(d => ({ ...d, _B: B }));
-    this._drawLine(ctx, tagged, tx, cy, 'oklch(0.78 0.15 65)', 'oklch(0.78 0.15 65 / 0.10)');
+    this._drawLine(ctx, pts, tx, cy, 'oklch(0.78 0.15 65)', 'oklch(0.78 0.15 65 / 0.10)', B);
     const last = pts[pts.length - 1], xL = tx(last.t);
     this._dot(ctx, xL, cy(last), 'oklch(0.78 0.15 65)');
   }
+}
+
+// Fields each tab plots; decimation must preserve their extremes.
+const TAB_FIELDS = { va: ['v', 'a'], capacity: ['ah', 'wh'], dpdn: ['dp', 'dn'], temp: ['temp'] };
+
+// First index whose timestamp is >= t (or > t when `after` is set). Data is time-ordered.
+function firstIndex(data, t, after) {
+  let lo = 0, hi = data.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (data[mid].t < t || (after && data[mid].t === t)) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+// Long sessions hold far more readings than the plot has pixels. Reduce
+// data[from..to) to the first, last and per-field min/max reading of each pixel
+// column so the trace looks the same while a frame stays cheap to draw.
+function decimate(data, from, to, t0, win, cols, fields) {
+  if (to - from <= cols * 4) return data.slice(from, to);
+  const out = [], nf = fields.length, scale = cols / win;
+  const lo = new Float64Array(nf), hi = new Float64Array(nf);
+  const loI = new Int32Array(nf), hiI = new Int32Array(nf);
+  const reset = () => { lo.fill(Infinity); hi.fill(-Infinity); loI.fill(-1); hiI.fill(-1); };
+  let start = from, col = Math.floor((data[from].t - t0) * scale);
+  const flush = last => {
+    const idx = [start, last, ...loI, ...hiI].filter(i => i >= 0).sort((a, b) => a - b);
+    for (let k = 0; k < idx.length; k++) if (!k || idx[k] !== idx[k - 1]) out.push(data[idx[k]]);
+  };
+  reset();
+  for (let i = from; i < to; i++) {
+    const d = data[i], c = Math.floor((d.t - t0) * scale);
+    if (c !== col) { flush(i - 1); start = i; col = c; reset(); }
+    for (let f = 0; f < nf; f++) {
+      const x = d[fields[f]]; // NaN (no reading yet) fails both comparisons
+      if (x < lo[f]) { lo[f] = x; loI[f] = i; }
+      if (x > hi[f]) { hi[f] = x; hiI[f] = i; }
+    }
+  }
+  flush(to - 1);
+  return out;
 }
 
 function niceCeil(x, step) {
@@ -1501,6 +1556,7 @@ const $ = id => document.getElementById(id);
 
 const state = {
   connected: false, connecting: false, streaming: false, recording: false,
+  streamBusy: false,
   client: new BleClient(), logger: new Logger(), chart: null,
   last: { vbus: 0, ibus: 0, power: 0, temp: NaN, dp: NaN, dn: NaN, protocol: '—', wh: 0, ah: 0 },
   stats: { iMin: Infinity, iMax: -Infinity, pSum: 0, pN: 0, pMax: 0 },
@@ -1511,8 +1567,10 @@ function fmt(n, d = 2) {
   if (n === undefined || n === null || Number.isNaN(n)) return '—';
   return n.toFixed(d);
 }
+// A zero held over from before any data arrived is "no reading", not 0.
+const isIdleZero = val => val === 0 && !state.streaming && !state.demo;
 function bigNumber(el, val, digits, unitSuffix) {
-  if (val === undefined || val === null || Number.isNaN(val) || val === 0 && !state.streaming && !state.demo) {
+  if (val === undefined || val === null || Number.isNaN(val) || isIdleZero(val)) {
     el.innerHTML = '<span class="dim">—</span>';
     return;
   }
@@ -1571,8 +1629,8 @@ function updateMetrics() {
   } else if (_tab === 'temp') {
     $('legendV').textContent = Number.isFinite(m.temp) ? fmt(m.temp, 1) + '°C' : '—';
   } else {
-    $('legendV').textContent = Number.isFinite(m.vbus) && m.vbus ? fmt(m.vbus, 2) + 'V' : '—';
-    $('legendA').textContent = Number.isFinite(m.ibus) && m.ibus ? fmt(m.ibus, 3) + 'A' : '—';
+    $('legendV').textContent = Number.isFinite(m.vbus) && !isIdleZero(m.vbus) ? fmt(m.vbus, 2) + 'V' : '—';
+    $('legendA').textContent = Number.isFinite(m.ibus) && !isIdleZero(m.ibus) ? fmt(m.ibus, 3) + 'A' : '—';
   }
 }
 
@@ -1586,16 +1644,24 @@ function onMeasurement(m) {
   updateMetrics();
 }
 
+// Single exit for a recording. Safe to call from several paths at once
+// (Stop, Disconnect and an unexpected link drop can all race).
+async function stopRecording() {
+  if (!state.recording) return;
+  state.recording = false;
+  $('btnRecord').classList.remove('recording');
+  $('btnStopRecord').disabled = true;
+  try { await state.logger.stopSession(); } catch (e) { console.error(e); }
+  // Decide from the state now, not from when Stop was pressed: the link may have gone.
+  $('btnRecord').disabled = !state.streaming || state.recording;
+  try { await refreshSessions(); } catch (e) { console.error(e); }
+}
+
 function onStatus(type, info) {
   if (type === 'disconnected') {
-    if (state.recording) {
-      state.recording = false;
-      $('btnRecord').classList.remove('recording');
-      $('btnStopRecord').disabled = true;
-      state.logger.stopSession().then(refreshSessions);
-    }
-    setConnState('idle', 'Disconnected');
     state.connected = false; state.streaming = false;
+    stopRecording();
+    setConnState('idle', 'Disconnected');
     $('btnConnect').disabled = state.connecting;
     $('btnStream').disabled = true;
     $('btnDisconnect').disabled = true;
@@ -1609,7 +1675,7 @@ function onStatus(type, info) {
     $('dcBanner').classList.add('visible');
   } else if (type === 'info') {
     $('diModel').textContent  = `FNB${info.model}`;
-    $('diFw').textContent     = info.fw;
+    $('diFw').textContent     = info.fw.toFixed(2);
     $('diSn').textContent     = info.sn;
     $('diGroups').textContent = `${info.groupCur} / ${info.groupMax}`;
     $('devState').textContent = 'online';
@@ -1699,10 +1765,13 @@ $('btnConnect').addEventListener('click', async () => {
     state.chart.unfreeze();
     $('dcBanner').classList.remove('visible');
   } catch (e) {
+    const chooserDismissed = !state.client.device && e.name === 'NotFoundError';
     await state.client.disconnect();
     state.connected = false; state.streaming = false;
     if (state.demo) { state.chart.unfreeze(); $('dcBanner').classList.remove('visible'); }
-    setConnState('error', e.message); console.error(e);
+    // Closing the device picker is a choice, not a fault.
+    if (chooserDismissed) setConnState('idle', 'Not connected');
+    else { setConnState('error', e.message); console.error(e); }
   } finally {
     state.connecting = false;
     $('btnConnect').disabled = state.connected;
@@ -1710,67 +1779,87 @@ $('btnConnect').addEventListener('click', async () => {
 });
 
 $('btnStream').addEventListener('click', async () => {
-  if (!state.streaming) {
-    await state.client.startStream();
-    state.streaming = true;
-    $('btnStream').textContent = 'Stop stream';
-    $('btnRecord').disabled = false;
-    $('btnClearGroup').disabled = false;
-    setConnState('streaming', 'Streaming');
-    $('graphEmpty').classList.add('hidden');
-    state.chart.unfreeze();
-    $('dcBanner').classList.remove('visible');
-  } else {
-    await state.client.stopStream();
-    state.streaming = false;
-    $('btnStream').textContent = 'Start stream';
-    $('btnRecord').disabled = true;
-    $('btnClearGroup').disabled = true;
-    setConnState('connected', 'Connected');
-    state.chart.freeze();
-    const ts = new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    $('dcTime').textContent = `at ${ts}`;
-    $('dcBanner').classList.add('visible');
+  // Starting takes ~2 s; a second click in that window must not start it twice.
+  if (!state.connected || state.streamBusy) return;
+  state.streamBusy = true;
+  $('btnStream').disabled = true;
+  try {
+    if (!state.streaming) {
+      setConnState('idle', 'Starting stream…');
+      await state.client.startStream();
+      state.streaming = true;
+      $('btnStream').textContent = 'Stop stream';
+      $('btnRecord').disabled = state.recording;
+      $('btnClearGroup').disabled = false;
+      setConnState('streaming', 'Streaming');
+      $('graphEmpty').classList.add('hidden');
+      state.chart.unfreeze();
+      $('dcBanner').classList.remove('visible');
+    } else {
+      await state.client.stopStream();
+      // The link dropped while stopping: the disconnect handler already updated the UI.
+      if (!state.connected) return;
+      state.streaming = false;
+      $('btnStream').textContent = 'Start stream';
+      $('btnRecord').disabled = true;
+      $('btnClearGroup').disabled = true;
+      setConnState('connected', 'Connected');
+      state.chart.freeze();
+      const ts = new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      $('dcTime').textContent = `at ${ts}`;
+      $('dcBanner').classList.add('visible');
+    }
+  } catch (e) {
+    console.error(e);
+    // Still connected: leave notifications in a known-off state and say why.
+    if (state.connected) { await state.client.stopStream(); setConnState('error', e.message); }
+  } finally {
+    state.streamBusy = false;
+    $('btnStream').disabled = !state.connected;
   }
 });
 
 $('btnDisconnect').addEventListener('click', async () => {
-  if (state.recording) $('btnStopRecord').click();
+  await stopRecording();
   await state.client.disconnect();
 });
 
 $('btnRecord').addEventListener('click', async () => {
-  if (state.recording) return;
-  await state.logger.startSession($('sessionName').value || 'Web session', +$('selGroup').value);
+  if (state.recording || !state.streaming || $('btnRecord').disabled) return;
+  $('btnRecord').disabled = true; // startSession is async; block a second click
+  try {
+    await state.logger.startSession($('sessionName').value || 'Web session', +$('selGroup').value);
+  } catch (e) {
+    console.error(e);
+    $('btnRecord').disabled = !state.streaming;
+    return alert(`Could not start recording: ${e.message}`);
+  }
+  if (!state.connected) { // link dropped while the session was being created
+    try { await state.logger.stopSession(); await refreshSessions(); } catch (e) { console.error(e); }
+    return;
+  }
   state.recording = true;
   $('btnRecord').classList.add('recording');
-  $('btnRecord').disabled = true;
   $('btnStopRecord').disabled = false;
   $('btnExportCsv').disabled = false;
   $('btnExportPng').disabled = false;
 });
 
-$('btnStopRecord').addEventListener('click', async () => {
-  if (!state.recording) return;
-  await state.logger.stopSession();
-  state.recording = false;
-  $('btnRecord').classList.remove('recording');
-  $('btnRecord').disabled = false;
-  $('btnStopRecord').disabled = true;
-  refreshSessions();
-});
+$('btnStopRecord').addEventListener('click', stopRecording);
 
-$('btnClearGroup').addEventListener('click', async () => {
+async function sendGroupCmd(cmd, verb, done) {
   const g = +$('selGroup').value;
-  await state.client.write(makeCmd(0x89, [g]));
-  setConnState(state.streaming ? 'streaming' : 'connected', `Cleared group ${g}`);
-});
-
-$('btnSwitchGroup').addEventListener('click', async () => {
-  const g = +$('selGroup').value;
-  await state.client.write(makeCmd(0x88, [g]));
-  setConnState(state.streaming ? 'streaming' : 'connected', `Switched to group ${g}`);
-});
+  const pill = () => state.streaming ? 'streaming' : 'connected';
+  try {
+    await state.client.write(makeCmd(cmd, [g]));
+    setConnState(pill(), `${done} group ${g}`);
+  } catch (e) {
+    console.error(e);
+    if (state.connected) setConnState(pill(), `${verb} group ${g} failed: ${e.message}`);
+  }
+}
+$('btnClearGroup').addEventListener('click', () => sendGroupCmd(0x89, 'Clear', 'Cleared'));
+$('btnSwitchGroup').addEventListener('click', () => sendGroupCmd(0x88, 'Switch to', 'Switched to'));
 
 function localStamp(ms) {
   if (!ms && ms !== 0) return '';
@@ -1808,6 +1897,7 @@ $('btnExportCsv').addEventListener('click', async () => {
   exportSessionCsv(sessions[0]);
 });
 
+const CHART_BG = 'oklch(0.115 0.008 250)'; // --bg-deep, the .graph-wrap backdrop
 const LEGEND_TABS = {
   va:       [['v', 'Voltage'], ['a', 'Current']],
   capacity: [['a', 'Ah'],     ['wh', 'Wh']],
@@ -1835,6 +1925,7 @@ $('chartTabs').addEventListener('click', e => {
   btn.classList.add('active');
   state.chart.setTab(btn.dataset.tab);
   updateLegend(btn.dataset.tab);
+  updateMetrics(); // refill the legend now; no new reading arrives while paused or offline
 });
 
 $('btnExportPng').addEventListener('click', () => {
@@ -1845,6 +1936,8 @@ $('btnExportPng').addEventListener('click', () => {
   const tmp = document.createElement('canvas');
   tmp.width = src.width; tmp.height = src.height;
   const ctx = tmp.getContext('2d');
+  // The live canvas is transparent over the page; the file needs its own backdrop.
+  ctx.fillStyle = CHART_BG; ctx.fillRect(0, 0, tmp.width, tmp.height);
   ctx.drawImage(src, 0, 0);
   const dpr = state.chart.dpr;
   const fmtTs = ms => new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
@@ -1923,7 +2016,10 @@ function init() {
   }
 
   state.chart = new Chart($('chart'));
-  state.logger.init().then(() => refreshSessions());
+  state.logger.init()
+    .then(() => state.logger.closeOrphanedSessions().catch(e => console.error(e)))
+    .then(refreshSessions)
+    .catch(e => console.error('Session storage unavailable:', e));
 
   $('winSelect').addEventListener('change', (e) => {
     const val = e.target.value;
@@ -1950,9 +2046,8 @@ function init() {
     const now = performance.now();
     if (now - lastFrame > 500) {
       fps = Math.round(frames * 1000 / (now - lastFrame));
-      $('footFps').textContent = `${fps} fps · demo trace`;
-      if (state.streaming) $('footFps').textContent = `${fps} fps · live`;
-      else if (state.connected) $('footFps').textContent = `${fps} fps · idle`;
+      const mode = state.streaming ? 'live' : state.connected ? 'idle' : state.demo ? 'demo trace' : 'offline';
+      $('footFps').textContent = `${fps} fps · ${mode}`;
       frames = 0; lastFrame = now;
     }
     requestAnimationFrame(loop);
